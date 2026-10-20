@@ -27,10 +27,17 @@ def _join_lines(lines):
 
 def _pdf_page_text(page):
     d = page.get_text("dict")
+    raw_blocks = d.get("blocks", [])
+    # Sort blocks in reading order (top-to-bottom, left-to-right)
+    sorted_blocks = sorted(
+        [b for b in raw_blocks if b.get("type") == 0],
+        key=lambda b: (round(b.get("bbox", [0, 0, 0, 0])[1] / 6) * 6, b.get("bbox", [0, 0, 0, 0])[0])
+    )
     blocks, size_chars = [], Counter()
-    for b in d["blocks"]:
-        if b.get("type") != 0:
-            continue
+    printed_page = None
+    rect = page.rect
+    page_h = rect.height if rect else 792.0
+    for b in sorted_blocks:
         lines, sizes, bold, chars = [], [], 0, 0
         for l in b["lines"]:
             txt = "".join(s["text"] for s in l["spans"]).strip()
@@ -47,14 +54,23 @@ def _pdf_page_text(page):
                     bold += n
         if lines:
             blocks.append(dict(lines=lines, size=max(sizes) if sizes else 0,
-                               bold=bold / max(chars, 1)))
+                               bold=bold / max(chars, 1), bbox=b.get("bbox", [0, 0, 0, 0])))
     if not blocks:
-        return []
+        return [], None
     body = size_chars.most_common(1)[0][0] if size_chars else 10
     out, h1, h2, last_h1 = [], "", "", False
     for b in blocks:
         joined = _join_lines([" ".join(b["lines"])] if len(b["lines"]) == 1 else b["lines"]).replace("\n", " ")
-        if len(joined) <= 3 and joined.isdigit():          # page number
+        bbox = b.get("bbox", [0, 0, 0, 0])
+        is_marginal = (bbox[3] > page_h * 0.80 or bbox[1] < page_h * 0.15)
+        if len(joined) <= 4 and joined.isdigit():          # page number
+            if printed_page is None or is_marginal:
+                printed_page = int(joined)
+            continue
+        m_page = re.search(r"^(?:page\s+|p\.\s*|-?\s*)?(\d+)(?:\s*-)?$", joined, re.IGNORECASE)
+        if m_page and is_marginal and len(joined) <= 10:
+            if printed_page is None:
+                printed_page = int(m_page.group(1))
             continue
         is_h = (len(joined) <= 110 and len(b["lines"]) <= 3
                 and not joined.endswith((".", ",", ";", ":"))
@@ -72,7 +88,7 @@ def _pdf_page_text(page):
         else:
             out.append(_join_lines(b["lines"]))
             last_h1 = False
-    return out
+    return out, printed_page
 
 
 # ------------------------------------------------------------------ other formats
@@ -94,18 +110,19 @@ def extract_sections(path: Path):
         pages = []
         with fitz.open(path) as doc:
             for i, page in enumerate(doc, start=1):
-                pages.append((i, _pdf_page_text(page)))
+                units, pp = _pdf_page_text(page)
+                pages.append((i, pp, units))
         # drop running headers/footers: short non-heading blocks repeated on many pages
         norm = lambda u: re.sub(r"\d+", "#", u.lower()).strip()
-        counts = Counter(norm(u) for _, units in pages for u in set(units)
+        counts = Counter(norm(u) for _, _, units in pages for u in set(units)
                          if not u.startswith("# ") and len(u) < 100)
         limit = max(4, int(0.35 * len(pages))) if len(pages) >= 6 else 10**9
         out = []
-        for i, units in pages:
+        for i, pp, units in pages:
             kept = [u for u in units if u.startswith("# ") or len(u) >= 100 or counts[norm(u)] < limit]
             text = "\n\n".join(kept).strip()
             if text:
-                out.append((i, text))
+                out.append((i, pp, text))
         return out
     if ext == ".docx":
         from docx import Document
@@ -119,9 +136,9 @@ def extract_sections(path: Path):
         for tbl in d.tables:
             for row in tbl.rows:
                 lines.append(" | ".join(c.text.strip() for c in row.cells))
-        return _group("\n\n".join(lines))
+        return [(n, None, t) for n, t in _group("\n\n".join(lines))]
     text = path.read_text(encoding="utf-8", errors="ignore")
-    return _group(text)
+    return [(n, None, t) for n, t in _group(text)]
 
 
 # ------------------------------------------------------------------ chunking
@@ -162,7 +179,12 @@ def _page_chunks(text, size):
 
     for u in units:
         if u.startswith("# "):
-            flush(); heading = u[2:].strip(); continue
+            if cur:
+                flush()
+                heading = u[2:].strip()
+            else:
+                heading = f"{heading} > {u[2:].strip()}" if heading else u[2:].strip()
+            continue
         if len(u) > size:
             flush()
             chunks.extend(wrap(p) for p in chunk_text(u, size))
@@ -171,17 +193,26 @@ def _page_chunks(text, size):
             flush()
         cur.append(u); n += len(u)
     flush()
-    return [c for c in chunks if len(c) > 40]
+    if not chunks and heading:
+        chunks.append(f"# {heading}")
+    return [c for c in chunks if len(c) > 30]
 
 
 def make_chunks(sections):
-    """-> list of (page, idx, text). Chunks never cross pages, so citations are exact."""
+    """-> list of (page, printed_page, idx, text). Chunks never cross pages, so citations are exact."""
     out, idx = [], 0
-    for page, text in sections:
+    for item in sections:
+        if len(item) == 3:
+            page, printed_page, text = item
+        else:
+            page, text = item
+            printed_page = None
         for c in _page_chunks(text, config.CHUNK_CHARS):
-            out.append((page, idx, c)); idx += 1
+            out.append((page, printed_page, idx, c)); idx += 1
     return out
 
 
-def embed_text(doc_name: str, page: int, chunk: str) -> str:
+def embed_text(doc_name: str, page: int, chunk: str, printed_page: int | None = None) -> str:
+    if printed_page and printed_page != page:
+        return f"{doc_name} (PDF page {page}, printed page {printed_page})\n{chunk}"
     return f"{doc_name} (page {page})\n{chunk}"

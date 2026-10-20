@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFileDialog, QHBoxLayout
                                QTextBrowser, QVBoxLayout, QWidget)
 
 import config
+import engine
 import ingest
 import rag
 import store
@@ -46,8 +47,10 @@ class IngestWorker(QThread):
                 for i in range(0, len(chunks), 32):
                     self.progress.emit(f"Embedding {p.name}: {i}/{len(chunks)}")
                     batch = chunks[i:i + 32]
-                    embs.append(rag.embed([ingest.embed_text(p.name, pg, t) for pg, _, t in batch],
-                                          "search_document: "))
+                    embs.append(rag.embed([
+                        ingest.embed_text(p.name, ch[0], ch[-1], ch[1] if len(ch) == 4 else None)
+                        for ch in batch
+                    ], "search_document: "))
                 dest = config.DOCS_DIR / f"{sha[:10]}_{p.name}"
                 shutil.copy2(p, dest)
                 store.add_document(p.name, dest, sha, p.suffix.lower().lstrip("."), chunks, np.vstack(embs))
@@ -195,12 +198,19 @@ class MainWindow(QWidget):
         lay = QHBoxLayout(self)
         lay.addWidget(split)
 
-    # ---- Ollama / documents
     def check_ollama(self):
+        if engine.is_in_process_available():
+            self.status.setText("In-process engine active ✓ (100% offline, zero prerequisites)")
+            self.model_box.clear()
+            self.model_box.addItem(f"Local: {config.LOCAL_CHAT_GGUF.name}", str(config.LOCAL_CHAT_GGUF))
+            return
         try:
             names = [m["model"] for m in rag.client.list()["models"]]
         except Exception:
-            self.status.setText("Ollama is NOT running.\nStart the Ollama app, then restart this program.")
+            self.status.setText(
+                "No local GGUF models found in models/ and Ollama is NOT running.\n"
+                "Either place GGUF models in models/ for standalone mode, or start Ollama."
+            )
             return
         base = {n.split(":")[0] for n in names}
         missing = [m for m in (config.EMBED_MODEL, config.CHAT_MODEL.split(":")[0]) if m not in base]
@@ -242,7 +252,10 @@ class MainWindow(QWidget):
     def on_ingested(self, summary):
         self.btn_send.setEnabled(True)
         self.reload_docs()
-        self.status.setText("Ollama connected ✓")
+        if engine.is_in_process_available():
+            self.status.setText("In-process engine active ✓ (100% offline, zero prerequisites)")
+        else:
+            self.status.setText("Ollama connected ✓  (all data stays on this computer)")
         QMessageBox.information(self, "Ingestion finished", summary)
 
     def remove_doc(self):

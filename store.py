@@ -30,9 +30,14 @@ def init():
         CREATE TABLE IF NOT EXISTS chunks(
             id INTEGER PRIMARY KEY,
             doc_id INTEGER REFERENCES docs(id) ON DELETE CASCADE,
-            page INTEGER, idx INTEGER, text TEXT, emb BLOB);
+            page INTEGER, idx INTEGER, text TEXT, emb BLOB,
+            printed_page INTEGER);
         CREATE INDEX IF NOT EXISTS ix_chunks_doc ON chunks(doc_id);
         """)
+        try:
+            c.execute("ALTER TABLE chunks ADD COLUMN printed_page INTEGER")
+        except sqlite3.OperationalError:
+            pass
 
 
 def sha_of_file(path: Path) -> str:
@@ -49,15 +54,22 @@ def doc_exists(sha: str) -> bool:
 
 
 def add_document(name, path, sha, kind, chunks, embs: np.ndarray):
-    """chunks: list of (page, idx, text); embs: normalized float32 matrix."""
+    """chunks: list of (page, printed_page, idx, text) or (page, idx, text); embs: normalized float32 matrix."""
     with db() as c:
         cur = c.execute("INSERT INTO docs(name,path,sha,kind,added) VALUES(?,?,?,?,?)",
                         (name, str(path), sha, kind, time.time()))
         doc_id = cur.lastrowid
+        records = []
+        for k, ch in enumerate(chunks):
+            if len(ch) == 4:
+                p, pp, i, t = ch
+            else:
+                p, i, t = ch
+                pp = None
+            records.append((doc_id, p, i, t, embs[k].astype(np.float32).tobytes(), pp))
         c.executemany(
-            "INSERT INTO chunks(doc_id,page,idx,text,emb) VALUES(?,?,?,?,?)",
-            [(doc_id, p, i, t, embs[k].astype(np.float32).tobytes())
-             for k, (p, i, t) in enumerate(chunks)])
+            "INSERT INTO chunks(doc_id,page,idx,text,emb,printed_page) VALUES(?,?,?,?,?,?)",
+            records)
     return doc_id
 
 
@@ -79,13 +91,18 @@ def list_documents():
 def load_all():
     """Returns (meta list, embedding matrix)."""
     with db() as c:
-        rows = c.execute("""SELECT k.id, k.doc_id, d.name, d.path, d.kind, k.page, k.text, k.emb
-                            FROM chunks k JOIN docs d ON d.id=k.doc_id
-                            ORDER BY k.id""").fetchall()
+        has_pp = any(col[1] == "printed_page" for col in c.execute("PRAGMA table_info(chunks)").fetchall())
+        query = ("SELECT k.id, k.doc_id, d.name, d.path, d.kind, k.page, k.text, k.emb, k.printed_page "
+                 "FROM chunks k JOIN docs d ON d.id=k.doc_id ORDER BY k.id") if has_pp else (
+                 "SELECT k.id, k.doc_id, d.name, d.path, d.kind, k.page, k.text, k.emb "
+                 "FROM chunks k JOIN docs d ON d.id=k.doc_id ORDER BY k.id")
+        rows = c.execute(query).fetchall()
     meta, vecs = [], []
-    for cid, did, name, path, kind, page, text, emb in rows:
+    for r in rows:
+        cid, did, name, path, kind, page, text, emb = r[:8]
+        printed_page = r[8] if len(r) > 8 else None
         meta.append(dict(chunk_id=cid, doc_id=did, doc_name=name, path=path,
-                         kind=kind, page=page, text=text))
+                         kind=kind, page=page, text=text, printed_page=printed_page))
         vecs.append(np.frombuffer(emb, dtype=np.float32))
     mat = np.vstack(vecs) if vecs else np.zeros((0, 1), dtype=np.float32)
     return meta, mat

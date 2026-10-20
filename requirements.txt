@@ -1,6 +1,16 @@
+# Core RAG & UI dependencies
 PySide6>=6.7
 PyMuPDF>=1.24
 python-docx>=1.1
 rank-bm25>=0.2.2
 numpy>=1.26
 ollama>=0.4
+
+# Standalone / zero-prerequisite offline mode (optional but needed for .exe distribution)
+# Install these when building a standalone package (llama-cpp-python requires a C++ compiler or a prebuilt wheel)
+# llama-cpp-python>=0.2.90    # in-process GGUF chat & embedding inference
+# fastembed>=0.3.6             # lightweight fallback embedding (downloads model on first use)
+
+# Build & test utilities
+# pyinstaller>=6.9             # to build the .exe (run: python build_exe.py)
+# pytest>=8.0                  # to run the test suite

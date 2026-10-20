@@ -4,3 +4,13 @@ venv/
 .env
 data/
 .DS_Store
+
+# GGUF model files — too large for git (downloaded by download_models.py or GitHub Actions)
+models/*.gguf
+models/*.bin
+
+# PyInstaller build output
+build/
+dist/
+dist-installer/
+*.spec.bak

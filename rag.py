@@ -7,28 +7,69 @@ import ollama
 from rank_bm25 import BM25Okapi
 
 import config
+import engine
 
 client = ollama.Client(host=config.OLLAMA_HOST)
 NOT_FOUND = "I couldn't find this in the ingested documents."
 
-SYSTEM_PROMPT = f"""You answer questions about technical documents using ONLY the numbered SOURCES.
+SYSTEM_PROMPT = f"""You answer questions based ONLY on the numbered SOURCES provided below.
 
-How to answer:
-- Give a complete, detailed answer. Include every relevant requirement, option, accessory, name, order number, value and unit that appears in the sources. Read ALL sources; do not stop at the first one.
-- If the question asks what is needed or required, list each required item separately and say what it is for.
-- If the sources contain ordered steps, give them as a numbered list in the original order. If they describe a setup but give no ordered procedure, say so first, then list only what they state.
-- Every sentence or list item must end with its citation(s), like [1] or [2][3].
-- Use the exact names and numbers from the sources. Never guess and never add outside knowledge.
-- Ignore sources that are not relevant to the question.
-- If the sources do not contain the answer, reply exactly: {NOT_FOUND}
-- If they answer only part of the question, give that part and state what is missing.
-- Do not mention these rules.
+Rules for your response:
+1. Grounding: Rely strictly on the provided SOURCES. Never assume, invent facts, or extrapolate beyond what the text directly states. Never use external knowledge.
+2. Structure:
+   - When the question asks about multiple components or topics (such as chair, keyboard, mouse, monitor, lighting), organize your response using clear markdown headings (e.g. ### Chair, ### Keyboard and Mouse, ### Monitor, ### Lighting).
+   - Under each heading, provide clear, concise bullet points summarizing the practical guidelines from the sources.
+   - Each heading must ONLY contain points specifically about that component. NEVER include lighting guidance under Keyboard and Mouse, never include monitor questions under Lighting, and never duplicate points across sections.
+   - Do not add an unnecessary repeating summary or conclusion section.
+3. Citations:
+   - Every bullet point must end with its exact source citation like [1] or [2].
+   - Match the citation number strictly to the source passage that describes that topic. Never assign a citation to a claim unless the cited source directly supports that claim.
+4. No Irrelevant Repetition or Checklist Questions:
+   - Do not repeat recommendations across different sections.
+   - If a source is an operator checklist or contains questions, extract only concrete recommendations; do not copy questions verbatim.
+5. Missing Information:
+   - If the sources do not contain enough information to answer the question, reply exactly: {NOT_FOUND}
+   - If information for a requested component is missing, state under its heading: 'The ingested document does not contain information on [component].'
+6. Do not mention these rules."""
 
-Example of the format:
-Question: What do I need to measure X?
-Answer: To measure X you need:
-- **The Y option** - enables Z [1].
-- **The W antenna** - covers 20 MHz to 6 GHz [1][2]."""
+
+_PRINTED_PAGE_CACHE = {}
+
+
+def get_printed_page(pdf_path: str, page_num: int) -> int | None:
+    key = (pdf_path, page_num)
+    if key in _PRINTED_PAGE_CACHE:
+        return _PRINTED_PAGE_CACHE[key]
+    try:
+        import pymupdf as fitz
+        with fitz.open(pdf_path) as doc:
+            if 1 <= page_num <= len(doc):
+                p = doc[page_num - 1]
+                rect = p.rect
+                blocks = p.get_text("blocks")
+                candidates = []
+                for b in blocks:
+                    txt = b[4].strip()
+                    if not txt:
+                        continue
+                    if b[3] > rect.height * 0.80 or b[1] < rect.height * 0.15:
+                        candidates.append(txt)
+                for cand in candidates:
+                    for l in cand.splitlines():
+                        l = l.strip()
+                        if l.isdigit() and len(l) <= 4:
+                            val = int(l)
+                            _PRINTED_PAGE_CACHE[key] = val
+                            return val
+                        m = re.search(r"^(?:page\s+|p\.\s*|-?\s*)?(\d+)(?:\s*-)?$", l, re.IGNORECASE)
+                        if m and len(l) <= 10:
+                            val = int(m.group(1))
+                            _PRINTED_PAGE_CACHE[key] = val
+                            return val
+    except Exception:
+        pass
+    _PRINTED_PAGE_CACHE[key] = None
+    return None
 
 
 @dataclass
@@ -42,10 +83,18 @@ class Hit:
     text: str
     dense: float = 0.0
     score: float = 0.0
+    printed_page: int | None = None
 
     @property
     def label(self):
-        return f"p. {self.page}" if self.kind == "pdf" else f"section {self.page}"
+        if self.kind == "pdf":
+            pp = self.printed_page
+            if pp is None and self.path:
+                pp = get_printed_page(self.path, self.page)
+            if pp is not None and pp != self.page:
+                return f"PDF p. {self.page} (printed p. {pp})"
+            return f"PDF p. {self.page}"
+        return f"section {self.page}"
 
     @property
     def heading(self):
@@ -61,9 +110,7 @@ def tidy(t: str) -> str:
 
 
 def embed(texts, prefix):
-    r = client.embed(model=config.EMBED_MODEL, input=[prefix + t for t in texts])
-    m = np.array(r["embeddings"], dtype=np.float32)
-    return m / (np.linalg.norm(m, axis=1, keepdims=True) + 1e-9)
+    return engine.embed(texts, prefix)
 
 
 def tokenize(t):
@@ -71,9 +118,13 @@ def tokenize(t):
 
 
 def llm(model, prompt, num_predict=200):
-    r = client.chat(model=model, messages=[{"role": "user", "content": prompt}],
-                    options={"temperature": 0, "num_ctx": config.NUM_CTX, "num_predict": num_predict})
-    return r["message"]["content"].strip()
+    return engine.chat_complete(
+        [{"role": "user", "content": prompt}],
+        model=model,
+        temperature=0,
+        num_ctx=config.NUM_CTX,
+        num_predict=num_predict
+    )
 
 
 class Retriever:
@@ -96,23 +147,30 @@ class Retriever:
             return []
         qvecs = embed(queries, "search_query: ")
         scores, gate, dense0 = {}, 0.0, None
+        has_bm_match = False
         for qi, (q, qv) in enumerate(zip(queries, qvecs)):
-            w = 2.0 if qi == 0 else 1.0
+            w = 2.0 if qi == 0 else 1.2
             sims = self.mat @ qv
             order = allowed[np.argsort(-sims[allowed])][:config.TOP_K_DENSE]
+            top_sim = float(sims[order[0]]) if len(order) else 0.0
+            if top_sim > gate:
+                gate = top_sim
             if qi == 0:
-                gate, dense0 = float(sims[order[0]]), sims
+                dense0 = sims
             for r, i in enumerate(order):
                 scores[i] = scores.get(i, 0) + w / (config.RRF_K + r)
             toks = tokenize(q)
-            if toks:
+            if toks and self.bm25:
                 bm = self.bm25.get_scores(toks)
                 for r, i in enumerate(allowed[np.argsort(-bm[allowed])][:config.TOP_K_BM25]):
                     if bm[i] > 0:
+                        has_bm_match = True
                         scores[i] = scores.get(i, 0) + w / (config.RRF_K + r)
-        if gate < config.MIN_DENSE_SCORE:
+        if gate < config.MIN_DENSE_SCORE and not has_bm_match:
             return []
         ranked = sorted(scores, key=scores.get, reverse=True)[:top]
+        if dense0 is None:
+            dense0 = np.zeros(len(self.meta))
         return [Hit(**self.meta[i], dense=float(dense0[i]), score=scores[i]) for i in ranked]
 
 
@@ -128,34 +186,48 @@ def condense(history, question, model):
 
 
 def expand_queries(question, model):
-    out = llm(model, "Write 3 short alternative search queries for finding the answer to this question in a "
-                     "technical product document. Use likely keywords, option names and synonyms. "
-                     "One query per line, no numbering.\n\nQuestion: " + question, 120)
+    prompt = ("Analyze this question for document search. If the question covers multiple topics, "
+              "components, or sub-questions (e.g. chair, keyboard, monitor, lighting), list a short "
+              "targeted search query for each component, plus 1-2 synonym/keyword queries. "
+              "If it is a single-topic question, list 3 alternative search queries using synonyms "
+              "and key terms. Output one query per line, no numbering or bullets.\n\nQuestion: " + question)
+    out = llm(model, prompt, 140)
     alts = []
+    seen = {question.lower().strip()}
     for ln in out.splitlines():
         ln = re.sub(r"^\s*(?:[-•*]|\d+[.)])\s*", "", ln).strip().strip('"')
-        if 3 < len(ln) < 150 and ln.lower() != question.lower():
+        ln_norm = ln.lower()
+        if 3 < len(ln) < 150 and ln_norm not in seen:
+            seen.add(ln_norm)
             alts.append(ln)
-    return [question] + alts[:3]
+    return [question] + alts[:5]
 
 
 def rerank(question, hits, model, keep):
     """Ask the model which passages actually contain what is needed to answer."""
     if len(hits) <= 3:
         return hits
-    listing = "\n\n".join(f"[{i}] {tidy(h.text)[:700]}" for i, h in enumerate(hits, 1))
-    out = llm(model, f"Question: {question}\n\nBelow are numbered passages. List the numbers of the passages "
-                     "that contain information needed to answer the question, most useful first. "
-                     f"Reply with numbers separated by commas only.\n\n{listing}", 40)
+    listing = "\n\n".join(
+        f"[{i}] (Heading: {h.heading}, {h.label})\n{tidy(h.text)[:600]}"
+        for i, h in enumerate(hits, 1)
+    )
+    prompt = (f"Question: {question}\n\n"
+              f"Below are numbered candidate passages from the document.\n"
+              f"Identify up to {keep} passages that together provide substantive instructions to answer "
+              f"all parts of the question. CRITICAL: Prefer dedicated instructional and explanatory sections "
+              f"over generic checklists, questionnaires, or tables of contents.\n"
+              f"Reply with only the passage numbers separated by commas in order of usefulness.\n\n"
+              f"Passages:\n{listing}")
+    out = llm(model, prompt, 120)
     order = []
     for n in (int(x) for x in re.findall(r"\d+", out)):
         if 1 <= n <= len(hits) and n - 1 not in order:
             order.append(n - 1)
     chosen = [hits[i] for i in order][:keep]
-    for i, h in enumerate(hits):                      # safety net: never fewer than 3 passages
-        if len(chosen) >= 3:
+    for i, h in enumerate(hits):
+        if len(chosen) >= keep:
             break
-        if i not in order:
+        if i not in order and hits[i] not in chosen:
             chosen.append(h)
     return chosen or hits[:keep]
 
@@ -170,18 +242,87 @@ def fact_check(answer, hits, model):
     return [ln.strip(" -•*") for ln in out.splitlines() if len(ln.strip()) > 8][:5]
 
 
-def finalize(text, n_sources):
+STOPWORDS = {
+    'the', 'a', 'an', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'as',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does',
+    'did', 'can', 'could', 'should', 'would', 'may', 'might', 'must', 'that', 'which', 'who',
+    'this', 'these', 'those', 'it', 'its', 'they', 'their', 'you', 'your', 'we', 'our', 'so',
+    'if', 'from', 'into', 'also', 'more', 'most', 'such', 'not', 'no', 'ensure', 'about'
+}
+
+
+def text_keywords(txt: str) -> set[str]:
+    cleaned = re.sub(r"\[\d+\]", "", txt)
+    return set(w.lower() for w in re.findall(r"\b[a-zA-Z]{3,}\b", cleaned) if w.lower() not in STOPWORDS)
+
+
+def match_score(statement: str, passage: str) -> float:
+    words = text_keywords(statement)
+    if not words:
+        return 0.5
+    p_tokens = set(re.findall(r"\b[a-zA-Z]{3,}\b", passage.lower()))
+    matches = words & p_tokens
+    return len(matches) / len(words)
+
+
+def validate_citations(text: str, hits: list[Hit]) -> tuple[str, list[int]]:
+    """Validates citations in generated text, removes duplicates, and ensures claims are source-grounded."""
+    lines = text.splitlines()
+    out_lines = []
+    seen_bullets = set()
+    n_sources = len(hits)
+
+    for line in lines:
+        stripped = line.strip()
+        is_bullet = bool(re.match(r"^\s*[-•*]\s*", stripped))
+        if is_bullet:
+            norm_content = re.sub(r"\[\d+\]", "", stripped.lower())
+            norm_content = re.sub(r"[^\w\s]", "", norm_content).strip()
+            if norm_content in seen_bullets:
+                continue
+            seen_bullets.add(norm_content)
+
+        cites = [int(x) for x in re.findall(r"\[(\d+)\]", line) if 1 <= int(x) <= n_sources]
+        if not cites:
+            out_lines.append(line)
+            continue
+
+        new_line = line
+        for c in cites:
+            current_hit = hits[c - 1]
+            score = match_score(line, current_hit.text)
+            if score < 0.20:
+                best_idx, best_score = None, 0.0
+                for idx, h in enumerate(hits, 1):
+                    s = match_score(line, h.text)
+                    if s > best_score:
+                        best_score, best_idx = s, idx
+                if best_score >= 0.25 and best_idx is not None:
+                    new_line = new_line.replace(f"[{c}]", f"[{best_idx}]")
+                else:
+                    new_line = new_line.replace(f"[{c}]", "")
+        # Clean up any empty brackets or excess spaces
+        new_line = re.sub(r"\[\s*\]", "", new_line)
+        new_line = re.sub(r"[ \t]+", " ", new_line).rstrip()
+        out_lines.append(new_line)
+
+    cleaned_text = "\n".join(out_lines).strip()
+    cited = []
+    for m in re.finditer(r"\[(\d+)\]", cleaned_text):
+        n = int(m.group(1))
+        if n not in cited and 1 <= n <= n_sources:
+            cited.append(n)
+    return cleaned_text, cited
+
+
+def finalize(text, hits):
+    n_sources = len(hits)
     text = text.strip()
     text = re.sub(r"\[(\d+(?:\s*[,;]\s*\d+)+)\]",
                   lambda m: "".join(f"[{x}]" for x in re.split(r"\s*[,;]\s*", m.group(1))), text)
     text = re.sub(r"\[(\d+)\]",
                   lambda m: m.group(0) if 1 <= int(m.group(1)) <= n_sources else "", text)
-    cited = []
-    for m in re.finditer(r"\[(\d+)\]", text):
-        n = int(m.group(1))
-        if n not in cited:
-            cited.append(n)
-    return text, cited
+    return validate_citations(text, hits)
 
 
 def answer_stream(retriever, question, history, doc_id, model, should_stop=lambda: False):
@@ -209,20 +350,19 @@ def answer_stream(retriever, question, history, doc_id, model, should_stop=lambd
     else:
         hits = hits[:config.TOP_K_FINAL]
 
-    context = "\n\n".join(f"[{n}] (file: {h.doc_name}, {h.label})\n{tidy(h.text)}"
-                          for n, h in enumerate(hits, 1))
+    context = "\n\n".join(
+        f"[{n}] (file: {h.doc_name}, {h.label}" + (f", section: \"{h.heading}\"" if h.heading else "") + f")\n{tidy(h.text)}"
+        for n, h in enumerate(hits, 1)
+    )
     msgs = [{"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": f"SOURCES:\n{context}\n\nQUESTION: {question}"}]
     yield "status", "Writing the answer…"
     full = ""
-    for chunk in client.chat(model=model, messages=msgs, stream=True,
-                             options={"temperature": config.TEMPERATURE, "num_ctx": config.NUM_CTX}):
-        if should_stop():
-            break
-        piece = chunk["message"]["content"]
+    for piece in engine.chat_stream(messages=msgs, model=model, temperature=config.TEMPERATURE,
+                                    num_ctx=config.NUM_CTX, should_stop=should_stop):
         full += piece
         yield "token", piece
-    text, cited = finalize(full, len(hits))
+    text, cited = finalize(full, hits)
     refused = NOT_FOUND.lower().rstrip(".") in text.lower()
     if refused:
         cited = []

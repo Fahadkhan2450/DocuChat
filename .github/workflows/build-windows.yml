@@ -1,0 +1,89 @@
+name: Build Windows Installer
+
+on:
+  # Run manually from the GitHub Actions tab
+  workflow_dispatch:
+  # OR run automatically on every push to main
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**.md'
+
+jobs:
+  build-windows-exe:
+    runs-on: windows-latest    # Real Windows Server 2022 VM — free on GitHub
+
+    steps:
+      # ── 1. Checkout code ────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Set up Python 3.11 (has prebuilt llama-cpp-python wheels) ────────
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # ── 3. Cache pip packages ────────────────────────────────────────────────
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~\AppData\Local\pip\Cache
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: ${{ runner.os }}-pip-
+
+      # ── 4. Install Python dependencies ──────────────────────────────────────
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+          pip install llama-cpp-python --extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+          pip install fastembed
+
+      # ── 5. Cache GGUF models (avoid re-downloading on every build) ──────────
+      - name: Cache GGUF models
+        id: cache-models
+        uses: actions/cache@v4
+        with:
+          path: models
+          key: gguf-models-qwen25-3b-nomic-v1.5
+
+      # ── 6. Download GGUF models (skipped if cache hit) ──────────────────────
+      - name: Download GGUF models
+        if: steps.cache-models.outputs.cache-hit != 'true'
+        run: |
+          python download_models.py
+        timeout-minutes: 60
+
+      # ── 7. Verify models exist ───────────────────────────────────────────────
+      - name: Verify models
+        run: |
+          dir models
+          python -c "from pathlib import Path; assert Path('models/qwen2.5-3b-instruct-q4_k_m.gguf').exists(), 'Chat model missing!'; assert Path('models/nomic-embed-text-v1.5.Q4_K_M.gguf').exists(), 'Embed model missing!'; print('All models present')"
+
+      # ── 8. Build with PyInstaller ────────────────────────────────────────────
+      - name: Build standalone exe (PyInstaller)
+        run: |
+          python -m PyInstaller --noconfirm DocuChat.spec
+
+      # ── 9. Install Inno Setup ────────────────────────────────────────────────
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup --yes --no-progress
+        shell: pwsh
+
+      # ── 10. Compile Windows installer ───────────────────────────────────────
+      - name: Compile installer (Inno Setup)
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+        shell: pwsh
+
+      # ── 11. Upload installer as downloadable artifact ───────────────────────
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DocuChat-Setup-v2.0-Windows
+          path: dist-installer\DocuChat-Setup-v2.0.exe
+          retention-days: 30
+          if-no-files-found: error
